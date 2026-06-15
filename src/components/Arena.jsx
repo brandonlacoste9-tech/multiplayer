@@ -6,17 +6,9 @@ const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://eurrfbiavliah
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV1cnJmYmlhdmxpYWhtaGR4eWJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEyMDYyMTUsImV4cCI6MjA5Njc4MjIxNX0.hW7E5Z-02WTBiezSjUzjIBjfMc3OgYexFlvzlgJO3p0';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-const MAP_WIDTH = 3000;
-const MAP_HEIGHT = 3000;
-const START_RADIUS = 20;
-const FOOD_RADIUS = 5;
-const EMPIRE_COIN_RADIUS = 12;
-const MAX_FOOD = 300;
-
-const getRandomColor = () => {
-  const colors = [0x00f3ff, 0xff003c, 0x00ffaa, 0xf7931a, 0xff00ff, 0xffff00, 0xffffff];
-  return colors[Math.floor(Math.random() * colors.length)];
-};
+const MAP_WIDTH = 4000;
+const MAP_HEIGHT = 4000;
+const MAX_COINS = 50;
 
 class MainScene extends Phaser.Scene {
     constructor() {
@@ -29,83 +21,90 @@ class MainScene extends Phaser.Scene {
         this.playerName = data.playerName;
         
         this.myState = {
-            radius: START_RADIUS,
-            color: getRandomColor(),
-            score: 0
+            hp: 100,
+            score: 0,
+            x: 0,
+            y: 0,
+            rotation: 0
         };
         
         this.otherPlayersData = {};
         this.otherPlayersSprites = {};
-        this.foods = {};
+        this.otherPlayersLasers = {};
         this.empireCoins = {};
         
         this.lastPresenceSync = 0;
-        this.lastFoodSpawn = 0;
+        this.lastCoinSpawn = 0;
         this.isDead = false;
     }
 
-    create() {
-        // Create textures for sprites
+    preload() {
+        // Load the scraped assets from the public folder
+        this.load.image('bg', '/assets/images/foozle/bg1.png');
+        this.load.image('ship', '/assets/images/foozle/fighter.png');
+        this.load.image('enemy', '/assets/images/foozle/scout.png');
+        this.load.image('bullet', '/assets/images/foozle/bullet.png');
+        // We will generate a coin texture since the repo might not have a golden coin
         const g = this.add.graphics();
-        g.fillStyle(0xffffff, 1);
-        g.fillCircle(50, 50, 50);
-        g.generateTexture('circle', 100, 100);
+        g.fillStyle(0xfbbf24, 1);
+        g.fillCircle(12, 12, 12);
+        g.generateTexture('coin', 24, 24);
         g.destroy();
+    }
 
-        // World Bounds & Camera
+    create() {
         this.physics.world.setBounds(0, 0, MAP_WIDTH, MAP_HEIGHT);
         this.cameras.main.setBounds(0, 0, MAP_WIDTH, MAP_HEIGHT);
         
-        // Grid Background
-        this.add.grid(MAP_WIDTH/2, MAP_HEIGHT/2, MAP_WIDTH, MAP_HEIGHT, 50, 50, 0x0f172a, 1, 0x1e293b, 1);
-
-        // Map Border
-        const border = this.add.graphics();
-        border.lineStyle(10, 0xef4444, 1);
-        border.strokeRect(0, 0, MAP_WIDTH, MAP_HEIGHT);
-
-        // Player Sprite
+        // Tiling background
+        this.bg = this.add.tileSprite(MAP_WIDTH/2, MAP_HEIGHT/2, MAP_WIDTH, MAP_HEIGHT, 'bg');
+        
+        // Create Player
         const startX = Phaser.Math.Between(100, MAP_WIDTH - 100);
         const startY = Phaser.Math.Between(100, MAP_HEIGHT - 100);
-        
-        this.player = this.physics.add.sprite(startX, startY, 'circle');
-        this.player.setTint(this.myState.color);
-        this.player.setDisplaySize(START_RADIUS * 2, START_RADIUS * 2);
-        this.player.setCircle(50); // The original texture is 100x100, so radius is 50
+        this.myState.x = startX;
+        this.myState.y = startY;
+
+        this.player = this.physics.add.sprite(startX, startY, 'ship');
         this.player.setCollideWorldBounds(true);
+        this.player.setDepth(10);
         
-        // Name Text
-        this.nameText = this.add.text(startX, startY - START_RADIUS - 10, this.playerName, { fontSize: '14px', fill: '#fff', fontStyle: 'bold' }).setOrigin(0.5);
-        this.scoreText = this.add.text(startX, startY + START_RADIUS + 10, '0', { fontSize: '12px', fill: '#fff' }).setOrigin(0.5);
-
+        // Camera Follow
         this.cameras.main.startFollow(this.player, true, 0.1, 0.1);
-
-        // Particle Manager
-        this.particles = this.add.particles('circle');
-
-        // Setup Realtime
-        this.setupRealtime();
         
-        // UI overlay (fixed to camera)
-        this.leaderboardText = this.add.text(this.cameras.main.width - 200, 20, 'Leaderboard\n...', {
-            fontSize: '16px', fill: '#fff', backgroundColor: 'rgba(0,0,0,0.5)', padding: { x: 10, y: 10 }
-        }).setScrollFactor(0);
+        // Input
+        this.cursors = this.input.keyboard.createCursorKeys();
+        this.wasd = {
+            w: this.input.keyboard.addKey('W'),
+            a: this.input.keyboard.addKey('A'),
+            s: this.input.keyboard.addKey('S'),
+            d: this.input.keyboard.addKey('D')
+        };
         
-        this.deathText = this.add.text(this.cameras.main.width/2, this.cameras.main.height/2, 'YOU WERE EATEN\nClick to Respawn', {
+        // Shooting
+        this.lasers = this.physics.add.group();
+        this.input.on('pointerdown', () => this.shootLaser());
+
+        // UI
+        this.scoreText = this.add.text(20, 20, `Score: 0`, { fontSize: '24px', fill: '#fff', fontStyle: 'bold' }).setScrollFactor(0).setDepth(100);
+        this.hpText = this.add.text(20, 50, `HP: 100`, { fontSize: '24px', fill: '#00ffaa', fontStyle: 'bold' }).setScrollFactor(0).setDepth(100);
+
+        this.deathText = this.add.text(this.cameras.main.width/2, this.cameras.main.height/2, 'SHIP DESTROYED\nClick to Respawn', {
             fontSize: '40px', fill: '#ff003c', align: 'center', backgroundColor: 'rgba(0,0,0,0.8)', padding: { x: 20, y: 20 }
-        }).setOrigin(0.5).setScrollFactor(0).setVisible(false).setInteractive();
+        }).setOrigin(0.5).setScrollFactor(0).setVisible(false).setInteractive().setDepth(100);
         
         this.deathText.on('pointerdown', () => this.respawn());
-
-        // Fix resize issue with leaderboard
+        
         this.scale.on('resize', (gameSize) => {
-            this.leaderboardText.setPosition(gameSize.width - 200, 20);
             this.deathText.setPosition(gameSize.width/2, gameSize.height/2);
         });
+
+        // Setup Multiplayer
+        this.setupRealtime();
     }
 
     setupRealtime() {
-        this.channel = supabase.channel('empire_phaser', {
+        this.channel = supabase.channel('empire_space', {
             config: { presence: { key: this.playerId } }
         });
 
@@ -119,23 +118,26 @@ class MainScene extends Phaser.Scene {
             }
         });
 
-        this.channel.on('broadcast', { event: 'food_spawn' }, (payload) => {
-            this.spawnFoodSprite(payload.payload.food);
-        });
-
-        this.channel.on('broadcast', { event: 'food_eaten' }, (payload) => {
-            const id = payload.payload.id;
-            if (this.foods[id]) {
-                this.foods[id].destroy();
-                delete this.foods[id];
-            }
+        this.channel.on('broadcast', { event: 'laser_fired' }, (payload) => {
+            const { x, y, rotation } = payload.payload;
+            const laser = this.physics.add.sprite(x, y, 'bullet');
+            laser.setRotation(rotation);
+            laser.setDepth(5);
+            this.physics.velocityFromRotation(rotation - Math.PI/2, 600, laser.body.velocity);
+            
+            // Add to physics group so we can check if it hits US
+            this.otherPlayersLasers[payload.payload.laserId] = laser;
+            setTimeout(() => {
+                if(laser) laser.destroy();
+                delete this.otherPlayersLasers[payload.payload.laserId];
+            }, 2000); // laser expires
         });
 
         this.channel.on('broadcast', { event: 'coin_spawn' }, (payload) => {
-            this.spawnCoinSprite(payload.payload.coin);
+            this.spawnCoin(payload.payload.coin);
         });
 
-        this.channel.on('broadcast', { event: 'coin_eaten' }, (payload) => {
+        this.channel.on('broadcast', { event: 'coin_collected' }, (payload) => {
             const id = payload.payload.id;
             if (this.empireCoins[id]) {
                 this.empireCoins[id].destroy();
@@ -143,200 +145,159 @@ class MainScene extends Phaser.Scene {
             }
         });
 
-        this.channel.on('broadcast', { event: 'player_eaten' }, (payload) => {
-            if (payload.payload.victimId === this.playerId) {
-                this.die();
-            } else {
-                // If another player was eaten, trigger explosion at their location
-                const p = this.otherPlayersData[payload.payload.victimId];
-                if (p) this.explode(p.x, p.y, p.color);
-            }
-        });
-
         this.channel.subscribe(async (status) => {
             if (status === 'SUBSCRIBED') {
                 await this.syncPresence();
-                // Spawn initial foods if leader
-                if (Object.keys(this.foods).length === 0) {
-                    for(let i=0; i<50; i++) {
-                        const f = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(0, MAP_WIDTH), y: Phaser.Math.Between(0, MAP_HEIGHT), color: getRandomColor() };
-                        this.spawnFoodSprite(f);
-                        this.channel.send({ type: 'broadcast', event: 'food_spawn', payload: { food: f } });
+                if (Object.keys(this.empireCoins).length === 0) {
+                    // Leader spawns initial coins
+                    for(let i=0; i<15; i++) {
+                        const c = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(100, MAP_WIDTH-100), y: Phaser.Math.Between(100, MAP_HEIGHT-100) };
+                        this.spawnCoin(c);
+                        this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: c } });
                     }
-                    const c = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(0, MAP_WIDTH), y: Phaser.Math.Between(0, MAP_HEIGHT) };
-                    this.spawnCoinSprite(c);
-                    this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: c } });
                 }
             }
         });
     }
 
-    spawnFoodSprite(data) {
-        const sprite = this.add.sprite(data.x, data.y, 'circle');
-        sprite.setTint(data.color);
-        sprite.setDisplaySize(FOOD_RADIUS*2, FOOD_RADIUS*2);
-        this.foods[data.id] = sprite;
-    }
-
-    spawnCoinSprite(data) {
-        const sprite = this.add.sprite(data.x, data.y, 'circle');
-        sprite.setTint(0xfbbf24);
-        sprite.setDisplaySize(EMPIRE_COIN_RADIUS*2, EMPIRE_COIN_RADIUS*2);
-        
+    spawnCoin(data) {
+        const sprite = this.add.sprite(data.x, data.y, 'coin');
+        sprite.setDepth(8);
         this.tweens.add({
-            targets: sprite,
-            scaleX: 1.5,
-            scaleY: 1.5,
-            yoyo: true,
-            repeat: -1,
-            duration: 500
+            targets: sprite, scaleX: 1.5, scaleY: 1.5, yoyo: true, repeat: -1, duration: 500
         });
-        
         this.empireCoins[data.id] = sprite;
     }
 
-    explode(x, y, color) {
-        const emitter = this.particles.createEmitter({
-            x: x,
-            y: y,
-            speed: { min: -200, max: 200 },
-            angle: { min: 0, max: 360 },
-            scale: { start: 0.2, end: 0 },
-            tint: color,
-            lifespan: 800,
-            gravityY: 0
+    shootLaser() {
+        if (this.isDead) return;
+        
+        // Ship points to mouse, laser shoots from nose
+        const laser = this.physics.add.sprite(this.player.x, this.player.y, 'bullet');
+        laser.setRotation(this.player.rotation);
+        laser.setDepth(5);
+        this.physics.velocityFromRotation(this.player.rotation - Math.PI/2, 600, laser.body.velocity);
+        
+        const laserId = Phaser.Math.RND.uuid();
+        this.channel.send({
+            type: 'broadcast',
+            event: 'laser_fired',
+            payload: { laserId, x: this.player.x, y: this.player.y, rotation: this.player.rotation }
         });
-        emitter.explode(20);
+
+        setTimeout(() => { if(laser) laser.destroy(); }, 2000);
+    }
+
+    takeDamage() {
+        if (this.isDead) return;
+        this.myState.hp -= 25;
+        this.hpText.setText(`HP: ${this.myState.hp}`);
+        this.cameras.main.shake(100, 0.02);
+        
+        if (this.myState.hp <= 0) {
+            this.die();
+        }
     }
 
     die() {
-        if (this.isDead) return;
         this.isDead = true;
-        this.explode(this.player.x, this.player.y, this.myState.color);
         this.player.setVisible(false);
         this.player.body.stop();
-        this.nameText.setVisible(false);
-        this.scoreText.setVisible(false);
         this.deathText.setVisible(true);
-        this.cameras.main.shake(300, 0.05);
+
+        // Spawn a coin where we died as loot
+        const drop = { id: Phaser.Math.RND.uuid(), x: this.player.x, y: this.player.y };
+        this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: drop } });
+
+        this.myState.score = 0;
+        this.scoreText.setText(`Score: 0`);
+        this.syncPresence(); // Sync dead state
     }
 
     respawn() {
         this.isDead = false;
-        this.myState.radius = START_RADIUS;
-        this.myState.score = 0;
+        this.myState.hp = 100;
         this.player.x = Phaser.Math.Between(100, MAP_WIDTH-100);
         this.player.y = Phaser.Math.Between(100, MAP_HEIGHT-100);
-        this.player.setDisplaySize(START_RADIUS*2, START_RADIUS*2);
         this.player.setVisible(true);
-        this.nameText.setVisible(true);
-        this.scoreText.setVisible(true);
         this.deathText.setVisible(false);
+        this.hpText.setText(`HP: 100`);
         this.syncPresence();
     }
 
     syncPresence() {
-        if (!this.channel || this.isDead) return;
+        if (!this.channel) return;
         this.channel.track({
             x: this.player.x,
             y: this.player.y,
-            radius: this.myState.radius,
-            color: this.myState.color,
+            rotation: this.player.rotation,
             name: this.playerName,
-            score: this.myState.score
+            isDead: this.isDead
         });
     }
 
-    update(time, delta) {
-        if (this.isDead) return;
+    update(time) {
+        if (!this.isDead) {
+            // Movement
+            const speed = 300;
+            let vx = 0;
+            let vy = 0;
+            
+            if (this.wasd.a.isDown || this.cursors.left.isDown) vx = -speed;
+            if (this.wasd.d.isDown || this.cursors.right.isDown) vx = speed;
+            if (this.wasd.w.isDown || this.cursors.up.isDown) vy = -speed;
+            if (this.wasd.s.isDown || this.cursors.down.isDown) vy = speed;
+            
+            this.player.setVelocity(vx, vy);
 
-        // Mouse Follow Physics
-        const pointer = this.input.activePointer;
-        const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
-        const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, worldPoint.x, worldPoint.y);
-        
-        if (dist > 10) {
-            const speed = Math.max(100, 6000 / this.myState.radius); // Decrease speed as radius grows
-            this.physics.moveTo(this.player, worldPoint.x, worldPoint.y, speed);
-        } else {
-            this.player.body.stop();
+            // Rotation (face mouse)
+            const pointer = this.input.activePointer;
+            const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+            this.player.rotation = Phaser.Math.Angle.Between(this.player.x, this.player.y, worldPoint.x, worldPoint.y) + Math.PI/2;
+
+            // Sync
+            if (time - this.lastPresenceSync > 50) { // 20 FPS sync
+                this.syncPresence();
+                this.lastPresenceSync = time;
+            }
         }
 
-        // Keep Text attached to player
-        this.nameText.setPosition(this.player.x, this.player.y - this.myState.radius - 15);
-        this.scoreText.setPosition(this.player.x, this.player.y + this.myState.radius + 15);
-        this.scoreText.setText(Math.floor(this.myState.score));
-
-        // Network Sync (Throttle to 10 FPS)
-        if (time - this.lastPresenceSync > 100) {
-            this.syncPresence();
-            this.lastPresenceSync = time;
-        }
-
-        // Auto Spawn Food if leader
-        if (time - this.lastFoodSpawn > 1000 && Object.keys(this.foods).length < MAX_FOOD) {
-            const f = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(0, MAP_WIDTH), y: Phaser.Math.Between(0, MAP_HEIGHT), color: getRandomColor() };
-            this.spawnFoodSprite(f);
-            this.channel.send({ type: 'broadcast', event: 'food_spawn', payload: { food: f } });
-            this.lastFoodSpawn = time;
+        // Auto spawn coins
+        if (time - this.lastCoinSpawn > 3000 && Object.keys(this.empireCoins).length < MAX_COINS) {
+            const c = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(100, MAP_WIDTH-100), y: Phaser.Math.Between(100, MAP_HEIGHT-100) };
+            this.spawnCoin(c);
+            this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: c } });
+            this.lastCoinSpawn = time;
         }
 
         this.checkCollisions();
         this.updateOtherPlayers();
-        this.updateLeaderboard();
     }
 
     checkCollisions() {
-        // Food Collision
-        for (const [id, f] of Object.entries(this.foods)) {
-            const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, f.x, f.y);
-            if (dist < this.myState.radius) {
-                f.destroy();
-                delete this.foods[id];
-                this.myState.radius = Math.sqrt(this.myState.radius**2 + FOOD_RADIUS**2);
-                this.player.setDisplaySize(this.myState.radius*2, this.myState.radius*2);
-                this.myState.score += 1;
-                this.channel.send({ type: 'broadcast', event: 'food_eaten', payload: { id } });
+        if (this.isDead) return;
+
+        // Check if other players lasers hit ME
+        for (const [id, laser] of Object.entries(this.otherPlayersLasers)) {
+            if (Phaser.Math.Distance.Between(this.player.x, this.player.y, laser.x, laser.y) < 30) {
+                // I got hit!
+                laser.destroy();
+                delete this.otherPlayersLasers[id];
+                this.takeDamage();
             }
         }
 
-        // Coin Collision
-        for (const [id, c] of Object.entries(this.empireCoins)) {
-            const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, c.x, c.y);
-            if (dist < this.myState.radius) {
-                c.destroy();
+        // Check if I collected a coin
+        for (const [id, coin] of Object.entries(this.empireCoins)) {
+            if (Phaser.Math.Distance.Between(this.player.x, this.player.y, coin.x, coin.y) < 40) {
+                coin.destroy();
                 delete this.empireCoins[id];
-                this.myState.radius = Math.sqrt(this.myState.radius**2 + (EMPIRE_COIN_RADIUS*2)**2);
-                this.player.setDisplaySize(this.myState.radius*2, this.myState.radius*2);
                 this.myState.score += 50;
-                this.channel.send({ type: 'broadcast', event: 'coin_eaten', payload: { id } });
-                this.explode(this.player.x, this.player.y, 0xfbbf24);
+                this.scoreText.setText(`Score: ${this.myState.score}`);
+                this.channel.send({ type: 'broadcast', event: 'coin_collected', payload: { id } });
                 
                 if (this.session) {
                     supabase.rpc('grant_points', { amount: 50 }).then(console.log).catch(console.error);
-                }
-            }
-        }
-
-        // Player PvP Collision
-        for (const [id, pData] of Object.entries(this.otherPlayersData)) {
-            const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, pData.x, pData.y);
-            if (dist < this.myState.radius && this.myState.radius > pData.radius * 1.15) {
-                // I ATE THEM
-                this.myState.radius = Math.sqrt(this.myState.radius**2 + pData.radius**2);
-                this.player.setDisplaySize(this.myState.radius*2, this.myState.radius*2);
-                this.myState.score += Math.max(10, pData.score);
-                this.channel.send({ type: 'broadcast', event: 'player_eaten', payload: { victimId: id } });
-                this.explode(pData.x, pData.y, pData.color);
-                this.cameras.main.shake(200, 0.02);
-                
-                // Immediately clean up locally to avoid double eat
-                delete this.otherPlayersData[id];
-                if (this.otherPlayersSprites[id]) {
-                    this.otherPlayersSprites[id].destroy();
-                    this.otherPlayersSprites[id].nameText.destroy();
-                    this.otherPlayersSprites[id].scoreText.destroy();
-                    delete this.otherPlayersSprites[id];
                 }
             }
         }
@@ -348,7 +309,6 @@ class MainScene extends Phaser.Scene {
             if (!this.otherPlayersData[id]) {
                 this.otherPlayersSprites[id].destroy();
                 this.otherPlayersSprites[id].nameText.destroy();
-                this.otherPlayersSprites[id].scoreText.destroy();
                 delete this.otherPlayersSprites[id];
             }
         }
@@ -356,41 +316,29 @@ class MainScene extends Phaser.Scene {
         // Add/Update existing
         for (const [id, pData] of Object.entries(this.otherPlayersData)) {
             if (!this.otherPlayersSprites[id]) {
-                const s = this.add.sprite(pData.x, pData.y, 'circle');
-                s.setTint(pData.color);
-                
-                const nt = this.add.text(pData.x, pData.y, pData.name, { fontSize: '14px', fill: '#fff', fontStyle: 'bold' }).setOrigin(0.5);
-                const st = this.add.text(pData.x, pData.y, pData.score, { fontSize: '12px', fill: '#fff' }).setOrigin(0.5);
-                
+                const s = this.add.sprite(pData.x, pData.y, 'enemy');
+                s.setDepth(9);
+                const nt = this.add.text(pData.x, pData.y + 40, pData.name, { fontSize: '14px', fill: '#ff003c', fontStyle: 'bold' }).setOrigin(0.5).setDepth(10);
                 s.nameText = nt;
-                s.scoreText = st;
                 this.otherPlayersSprites[id] = s;
             }
 
             const sprite = this.otherPlayersSprites[id];
-            sprite.x = Phaser.Math.Linear(sprite.x, pData.x, 0.3);
-            sprite.y = Phaser.Math.Linear(sprite.y, pData.y, 0.3);
-            sprite.setDisplaySize(pData.radius*2, pData.radius*2);
             
-            sprite.nameText.setPosition(sprite.x, sprite.y - pData.radius - 15);
-            sprite.scoreText.setPosition(sprite.x, sprite.y + pData.radius + 15);
-            sprite.scoreText.setText(Math.floor(pData.score));
+            if (pData.isDead) {
+                sprite.setVisible(false);
+                sprite.nameText.setVisible(false);
+            } else {
+                sprite.setVisible(true);
+                sprite.nameText.setVisible(true);
+                // Lerp position
+                sprite.x = Phaser.Math.Linear(sprite.x, pData.x, 0.4);
+                sprite.y = Phaser.Math.Linear(sprite.y, pData.y, 0.4);
+                // Hard set rotation
+                sprite.rotation = pData.rotation;
+                sprite.nameText.setPosition(sprite.x, sprite.y + 40);
+            }
         }
-    }
-
-    updateLeaderboard() {
-        const allPlayers = [
-            { name: this.playerName, score: this.myState.score },
-            ...Object.values(this.otherPlayersData).map(p => ({ name: p.name, score: p.score }))
-        ];
-        allPlayers.sort((a, b) => b.score - a.score);
-        const top5 = allPlayers.slice(0, 5);
-
-        let lbText = '🏆 Leaderboard\n\n';
-        top5.forEach((p, i) => {
-            lbText += `${i+1}. ${p.name} - ${Math.floor(p.score)}\n`;
-        });
-        this.leaderboardText.setText(lbText);
     }
 }
 
@@ -415,10 +363,7 @@ const Arena = () => {
           width: window.innerWidth,
           height: window.innerHeight,
           parent: gameContainer.current,
-          physics: {
-              default: 'arcade',
-              arcade: { debug: false }
-          },
+          physics: { default: 'arcade' },
           scene: [MainScene]
       };
 
@@ -449,7 +394,7 @@ const Arena = () => {
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', background: '#000' }}>
       {!session && !loading && (
-        <div style={{ position: 'absolute', top: 20, left: 20, background: '#330000', color: '#ff003c', padding: '10px 20px', borderRadius: '4px', border: '1px solid #ff003c', zIndex: 10 }}>
+        <div style={{ position: 'absolute', top: 20, right: 20, background: '#330000', color: '#ff003c', padding: '10px 20px', borderRadius: '4px', border: '1px solid #ff003c', zIndex: 10 }}>
           <strong>Warning:</strong> Guest Mode. Sign in via Headquarters to save Empire Points.
         </div>
       )}
