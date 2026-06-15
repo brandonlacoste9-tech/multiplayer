@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import Phaser from 'phaser';
 import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://eurrfbiavliahmhdxybp.supabase.co';
@@ -13,388 +14,446 @@ const EMPIRE_COIN_RADIUS = 12;
 const MAX_FOOD = 300;
 
 const getRandomColor = () => {
-  const colors = ['#00f3ff', '#ff003c', '#00ffaa', '#f7931a', '#ff00ff', '#ffff00', '#ffffff'];
+  const colors = [0x00f3ff, 0xff003c, 0x00ffaa, 0xf7931a, 0xff00ff, 0xffff00, 0xffffff];
   return colors[Math.floor(Math.random() * colors.length)];
 };
 
-const Arena = () => {
-  const canvasRef = useRef(null);
-  const [playerId, setPlayerId] = useState(null);
-  const [session, setSession] = useState(null);
-  const [isDead, setIsDead] = useState(false);
+class MainScene extends Phaser.Scene {
+    constructor() {
+        super({ key: 'MainScene' });
+    }
 
-  // Game State Refs
-  const myState = useRef({
-    x: Math.random() * MAP_WIDTH,
-    y: Math.random() * MAP_HEIGHT,
-    radius: START_RADIUS,
-    color: getRandomColor(),
-    name: 'Guest',
-    score: 0
-  });
-  
-  const mouse = useRef({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
-  const otherPlayers = useRef({});
-  const foods = useRef([]);
-  const empireCoins = useRef([]);
-  const channelRef = useRef(null);
+    init(data) {
+        this.playerId = data.playerId;
+        this.session = data.session;
+        this.playerName = data.playerName;
+        
+        this.myState = {
+            radius: START_RADIUS,
+            color: getRandomColor(),
+            score: 0
+        };
+        
+        this.otherPlayersData = {};
+        this.otherPlayersSprites = {};
+        this.foods = {};
+        this.empireCoins = {};
+        
+        this.lastPresenceSync = 0;
+        this.lastFoodSpawn = 0;
+        this.isDead = false;
+    }
 
-  useEffect(() => {
-    const initAuth = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      setSession(session);
-      const uuid = session?.user?.id || crypto.randomUUID();
-      setPlayerId(uuid);
-      if (session?.user?.email) {
-        myState.current.name = session.user.email.split('@')[0];
-      }
-    };
-    initAuth();
-  }, []);
+    create() {
+        // Create textures for sprites
+        const g = this.add.graphics();
+        g.fillStyle(0xffffff, 1);
+        g.fillCircle(50, 50, 50);
+        g.generateTexture('circle', 100, 100);
+        g.destroy();
 
-  const spawnFood = () => ({
-    id: crypto.randomUUID(),
-    x: Math.random() * MAP_WIDTH,
-    y: Math.random() * MAP_HEIGHT,
-    color: getRandomColor()
-  });
+        // World Bounds & Camera
+        this.physics.world.setBounds(0, 0, MAP_WIDTH, MAP_HEIGHT);
+        this.cameras.main.setBounds(0, 0, MAP_WIDTH, MAP_HEIGHT);
+        
+        // Grid Background
+        this.add.grid(MAP_WIDTH/2, MAP_HEIGHT/2, MAP_WIDTH, MAP_HEIGHT, 50, 50, 0x0f172a, 1, 0x1e293b, 1);
 
-  const respawn = () => {
-    myState.current = {
-      ...myState.current,
-      x: Math.random() * MAP_WIDTH,
-      y: Math.random() * MAP_HEIGHT,
-      radius: START_RADIUS,
-      score: 0
-    };
-    setIsDead(false);
-  };
+        // Map Border
+        const border = this.add.graphics();
+        border.lineStyle(10, 0xef4444, 1);
+        border.strokeRect(0, 0, MAP_WIDTH, MAP_HEIGHT);
 
-  useEffect(() => {
-    if (!playerId) return;
+        // Player Sprite
+        const startX = Phaser.Math.Between(100, MAP_WIDTH - 100);
+        const startY = Phaser.Math.Between(100, MAP_HEIGHT - 100);
+        
+        this.player = this.physics.add.sprite(startX, startY, 'circle');
+        this.player.setTint(this.myState.color);
+        this.player.setDisplaySize(START_RADIUS * 2, START_RADIUS * 2);
+        this.player.setCircle(50); // The original texture is 100x100, so radius is 50
+        this.player.setCollideWorldBounds(true);
+        
+        // Name Text
+        this.nameText = this.add.text(startX, startY - START_RADIUS - 10, this.playerName, { fontSize: '14px', fill: '#fff', fontStyle: 'bold' }).setOrigin(0.5);
+        this.scoreText = this.add.text(startX, startY + START_RADIUS + 10, '0', { fontSize: '12px', fill: '#fff' }).setOrigin(0.5);
 
-    const channel = supabase.channel('empire_agar', {
-      config: { presence: { key: playerId } }
-    });
-    channelRef.current = channel;
+        this.cameras.main.startFollow(this.player, true, 0.1, 0.1);
 
-    channel.on('presence', { event: 'sync' }, () => {
-      const state = channel.presenceState();
-      const updatedPlayers = {};
-      for (const [key, presences] of Object.entries(state)) {
-        if (key !== playerId && presences.length > 0) {
-          updatedPlayers[key] = presences[0];
-        }
-      }
-      otherPlayers.current = updatedPlayers;
-    });
+        // Particle Manager
+        this.particles = this.add.particles('circle');
 
-    channel.on('broadcast', { event: 'food_eaten' }, (payload) => {
-      foods.current = foods.current.filter(f => f.id !== payload.payload.id);
-    });
+        // Setup Realtime
+        this.setupRealtime();
+        
+        // UI overlay (fixed to camera)
+        this.leaderboardText = this.add.text(this.cameras.main.width - 200, 20, 'Leaderboard\n...', {
+            fontSize: '16px', fill: '#fff', backgroundColor: 'rgba(0,0,0,0.5)', padding: { x: 10, y: 10 }
+        }).setScrollFactor(0);
+        
+        this.deathText = this.add.text(this.cameras.main.width/2, this.cameras.main.height/2, 'YOU WERE EATEN\nClick to Respawn', {
+            fontSize: '40px', fill: '#ff003c', align: 'center', backgroundColor: 'rgba(0,0,0,0.8)', padding: { x: 20, y: 20 }
+        }).setOrigin(0.5).setScrollFactor(0).setVisible(false).setInteractive();
+        
+        this.deathText.on('pointerdown', () => this.respawn());
 
-    channel.on('broadcast', { event: 'food_spawn' }, (payload) => {
-      foods.current.push(payload.payload.food);
-    });
+        // Fix resize issue with leaderboard
+        this.scale.on('resize', (gameSize) => {
+            this.leaderboardText.setPosition(gameSize.width - 200, 20);
+            this.deathText.setPosition(gameSize.width/2, gameSize.height/2);
+        });
+    }
 
-    channel.on('broadcast', { event: 'coin_eaten' }, (payload) => {
-      empireCoins.current = empireCoins.current.filter(c => c.id !== payload.payload.id);
-    });
-
-    channel.on('broadcast', { event: 'player_eaten' }, (payload) => {
-      // If someone broadcasted that THEY ate ME, I need to die.
-      if (payload.payload.victimId === playerId) {
-        setIsDead(true);
-      }
-    });
-
-    channel.subscribe(async (status) => {
-      if (status === 'SUBSCRIBED') {
-        // Init presence
-        await channel.track({
-          x: myState.current.x,
-          y: myState.current.y,
-          radius: myState.current.radius,
-          color: myState.current.color,
-          name: myState.current.name,
-          score: myState.current.score
+    setupRealtime() {
+        this.channel = supabase.channel('empire_phaser', {
+            config: { presence: { key: this.playerId } }
         });
 
-        // Initialize food if we are alone
-        if (foods.current.length === 0) {
-          const initialFoods = Array.from({ length: 50 }, spawnFood);
-          foods.current = initialFoods;
-          // Spawn one rare empire coin
-          empireCoins.current.push({ id: crypto.randomUUID(), x: Math.random() * MAP_WIDTH, y: Math.random() * MAP_HEIGHT });
-        }
-      }
-    });
+        this.channel.on('presence', { event: 'sync' }, () => {
+            const state = this.channel.presenceState();
+            this.otherPlayersData = {};
+            for (const [key, presences] of Object.entries(state)) {
+                if (key !== this.playerId && presences.length > 0) {
+                    this.otherPlayersData[key] = presences[0];
+                }
+            }
+        });
 
-    const handleMouseMove = (e) => {
-      mouse.current.x = e.clientX;
-      mouse.current.y = e.clientY;
+        this.channel.on('broadcast', { event: 'food_spawn' }, (payload) => {
+            this.spawnFoodSprite(payload.payload.food);
+        });
+
+        this.channel.on('broadcast', { event: 'food_eaten' }, (payload) => {
+            const id = payload.payload.id;
+            if (this.foods[id]) {
+                this.foods[id].destroy();
+                delete this.foods[id];
+            }
+        });
+
+        this.channel.on('broadcast', { event: 'coin_spawn' }, (payload) => {
+            this.spawnCoinSprite(payload.payload.coin);
+        });
+
+        this.channel.on('broadcast', { event: 'coin_eaten' }, (payload) => {
+            const id = payload.payload.id;
+            if (this.empireCoins[id]) {
+                this.empireCoins[id].destroy();
+                delete this.empireCoins[id];
+            }
+        });
+
+        this.channel.on('broadcast', { event: 'player_eaten' }, (payload) => {
+            if (payload.payload.victimId === this.playerId) {
+                this.die();
+            } else {
+                // If another player was eaten, trigger explosion at their location
+                const p = this.otherPlayersData[payload.payload.victimId];
+                if (p) this.explode(p.x, p.y, p.color);
+            }
+        });
+
+        this.channel.subscribe(async (status) => {
+            if (status === 'SUBSCRIBED') {
+                await this.syncPresence();
+                // Spawn initial foods if leader
+                if (Object.keys(this.foods).length === 0) {
+                    for(let i=0; i<50; i++) {
+                        const f = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(0, MAP_WIDTH), y: Phaser.Math.Between(0, MAP_HEIGHT), color: getRandomColor() };
+                        this.spawnFoodSprite(f);
+                        this.channel.send({ type: 'broadcast', event: 'food_spawn', payload: { food: f } });
+                    }
+                    const c = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(0, MAP_WIDTH), y: Phaser.Math.Between(0, MAP_HEIGHT) };
+                    this.spawnCoinSprite(c);
+                    this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: c } });
+                }
+            }
+        });
+    }
+
+    spawnFoodSprite(data) {
+        const sprite = this.add.sprite(data.x, data.y, 'circle');
+        sprite.setTint(data.color);
+        sprite.setDisplaySize(FOOD_RADIUS*2, FOOD_RADIUS*2);
+        this.foods[data.id] = sprite;
+    }
+
+    spawnCoinSprite(data) {
+        const sprite = this.add.sprite(data.x, data.y, 'circle');
+        sprite.setTint(0xfbbf24);
+        sprite.setDisplaySize(EMPIRE_COIN_RADIUS*2, EMPIRE_COIN_RADIUS*2);
+        
+        this.tweens.add({
+            targets: sprite,
+            scaleX: 1.5,
+            scaleY: 1.5,
+            yoyo: true,
+            repeat: -1,
+            duration: 500
+        });
+        
+        this.empireCoins[data.id] = sprite;
+    }
+
+    explode(x, y, color) {
+        const emitter = this.particles.createEmitter({
+            x: x,
+            y: y,
+            speed: { min: -200, max: 200 },
+            angle: { min: 0, max: 360 },
+            scale: { start: 0.2, end: 0 },
+            tint: color,
+            lifespan: 800,
+            gravityY: 0
+        });
+        emitter.explode(20);
+    }
+
+    die() {
+        if (this.isDead) return;
+        this.isDead = true;
+        this.explode(this.player.x, this.player.y, this.myState.color);
+        this.player.setVisible(false);
+        this.player.body.stop();
+        this.nameText.setVisible(false);
+        this.scoreText.setVisible(false);
+        this.deathText.setVisible(true);
+        this.cameras.main.shake(300, 0.05);
+    }
+
+    respawn() {
+        this.isDead = false;
+        this.myState.radius = START_RADIUS;
+        this.myState.score = 0;
+        this.player.x = Phaser.Math.Between(100, MAP_WIDTH-100);
+        this.player.y = Phaser.Math.Between(100, MAP_HEIGHT-100);
+        this.player.setDisplaySize(START_RADIUS*2, START_RADIUS*2);
+        this.player.setVisible(true);
+        this.nameText.setVisible(true);
+        this.scoreText.setVisible(true);
+        this.deathText.setVisible(false);
+        this.syncPresence();
+    }
+
+    syncPresence() {
+        if (!this.channel || this.isDead) return;
+        this.channel.track({
+            x: this.player.x,
+            y: this.player.y,
+            radius: this.myState.radius,
+            color: this.myState.color,
+            name: this.playerName,
+            score: this.myState.score
+        });
+    }
+
+    update(time, delta) {
+        if (this.isDead) return;
+
+        // Mouse Follow Physics
+        const pointer = this.input.activePointer;
+        const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+        const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, worldPoint.x, worldPoint.y);
+        
+        if (dist > 10) {
+            const speed = Math.max(100, 6000 / this.myState.radius); // Decrease speed as radius grows
+            this.physics.moveTo(this.player, worldPoint.x, worldPoint.y, speed);
+        } else {
+            this.player.body.stop();
+        }
+
+        // Keep Text attached to player
+        this.nameText.setPosition(this.player.x, this.player.y - this.myState.radius - 15);
+        this.scoreText.setPosition(this.player.x, this.player.y + this.myState.radius + 15);
+        this.scoreText.setText(Math.floor(this.myState.score));
+
+        // Network Sync (Throttle to 10 FPS)
+        if (time - this.lastPresenceSync > 100) {
+            this.syncPresence();
+            this.lastPresenceSync = time;
+        }
+
+        // Auto Spawn Food if leader
+        if (time - this.lastFoodSpawn > 1000 && Object.keys(this.foods).length < MAX_FOOD) {
+            const f = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(0, MAP_WIDTH), y: Phaser.Math.Between(0, MAP_HEIGHT), color: getRandomColor() };
+            this.spawnFoodSprite(f);
+            this.channel.send({ type: 'broadcast', event: 'food_spawn', payload: { food: f } });
+            this.lastFoodSpawn = time;
+        }
+
+        this.checkCollisions();
+        this.updateOtherPlayers();
+        this.updateLeaderboard();
+    }
+
+    checkCollisions() {
+        // Food Collision
+        for (const [id, f] of Object.entries(this.foods)) {
+            const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, f.x, f.y);
+            if (dist < this.myState.radius) {
+                f.destroy();
+                delete this.foods[id];
+                this.myState.radius = Math.sqrt(this.myState.radius**2 + FOOD_RADIUS**2);
+                this.player.setDisplaySize(this.myState.radius*2, this.myState.radius*2);
+                this.myState.score += 1;
+                this.channel.send({ type: 'broadcast', event: 'food_eaten', payload: { id } });
+            }
+        }
+
+        // Coin Collision
+        for (const [id, c] of Object.entries(this.empireCoins)) {
+            const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, c.x, c.y);
+            if (dist < this.myState.radius) {
+                c.destroy();
+                delete this.empireCoins[id];
+                this.myState.radius = Math.sqrt(this.myState.radius**2 + (EMPIRE_COIN_RADIUS*2)**2);
+                this.player.setDisplaySize(this.myState.radius*2, this.myState.radius*2);
+                this.myState.score += 50;
+                this.channel.send({ type: 'broadcast', event: 'coin_eaten', payload: { id } });
+                this.explode(this.player.x, this.player.y, 0xfbbf24);
+                
+                if (this.session) {
+                    supabase.rpc('grant_points', { amount: 50 }).then(console.log).catch(console.error);
+                }
+            }
+        }
+
+        // Player PvP Collision
+        for (const [id, pData] of Object.entries(this.otherPlayersData)) {
+            const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, pData.x, pData.y);
+            if (dist < this.myState.radius && this.myState.radius > pData.radius * 1.15) {
+                // I ATE THEM
+                this.myState.radius = Math.sqrt(this.myState.radius**2 + pData.radius**2);
+                this.player.setDisplaySize(this.myState.radius*2, this.myState.radius*2);
+                this.myState.score += Math.max(10, pData.score);
+                this.channel.send({ type: 'broadcast', event: 'player_eaten', payload: { victimId: id } });
+                this.explode(pData.x, pData.y, pData.color);
+                this.cameras.main.shake(200, 0.02);
+                
+                // Immediately clean up locally to avoid double eat
+                delete this.otherPlayersData[id];
+                if (this.otherPlayersSprites[id]) {
+                    this.otherPlayersSprites[id].destroy();
+                    this.otherPlayersSprites[id].nameText.destroy();
+                    this.otherPlayersSprites[id].scoreText.destroy();
+                    delete this.otherPlayersSprites[id];
+                }
+            }
+        }
+    }
+
+    updateOtherPlayers() {
+        // Remove disconnected
+        for (const id in this.otherPlayersSprites) {
+            if (!this.otherPlayersData[id]) {
+                this.otherPlayersSprites[id].destroy();
+                this.otherPlayersSprites[id].nameText.destroy();
+                this.otherPlayersSprites[id].scoreText.destroy();
+                delete this.otherPlayersSprites[id];
+            }
+        }
+
+        // Add/Update existing
+        for (const [id, pData] of Object.entries(this.otherPlayersData)) {
+            if (!this.otherPlayersSprites[id]) {
+                const s = this.add.sprite(pData.x, pData.y, 'circle');
+                s.setTint(pData.color);
+                
+                const nt = this.add.text(pData.x, pData.y, pData.name, { fontSize: '14px', fill: '#fff', fontStyle: 'bold' }).setOrigin(0.5);
+                const st = this.add.text(pData.x, pData.y, pData.score, { fontSize: '12px', fill: '#fff' }).setOrigin(0.5);
+                
+                s.nameText = nt;
+                s.scoreText = st;
+                this.otherPlayersSprites[id] = s;
+            }
+
+            const sprite = this.otherPlayersSprites[id];
+            sprite.x = Phaser.Math.Linear(sprite.x, pData.x, 0.3);
+            sprite.y = Phaser.Math.Linear(sprite.y, pData.y, 0.3);
+            sprite.setDisplaySize(pData.radius*2, pData.radius*2);
+            
+            sprite.nameText.setPosition(sprite.x, sprite.y - pData.radius - 15);
+            sprite.scoreText.setPosition(sprite.x, sprite.y + pData.radius + 15);
+            sprite.scoreText.setText(Math.floor(pData.score));
+        }
+    }
+
+    updateLeaderboard() {
+        const allPlayers = [
+            { name: this.playerName, score: this.myState.score },
+            ...Object.values(this.otherPlayersData).map(p => ({ name: p.name, score: p.score }))
+        ];
+        allPlayers.sort((a, b) => b.score - a.score);
+        const top5 = allPlayers.slice(0, 5);
+
+        let lbText = '🏆 Leaderboard\n\n';
+        top5.forEach((p, i) => {
+            lbText += `${i+1}. ${p.name} - ${Math.floor(p.score)}\n`;
+        });
+        this.leaderboardText.setText(lbText);
+    }
+}
+
+const Arena = () => {
+  const gameContainer = useRef(null);
+  const gameInstance = useRef(null);
+  const [session, setSession] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const initGame = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      setSession(session);
+      
+      const playerId = session?.user?.id || crypto.randomUUID();
+      const playerName = session?.user?.email?.split('@')[0] || `Guest_${Math.floor(Math.random()*1000)}`;
+
+      if (gameInstance.current) return;
+
+      const config = {
+          type: Phaser.AUTO,
+          width: window.innerWidth,
+          height: window.innerHeight,
+          parent: gameContainer.current,
+          physics: {
+              default: 'arcade',
+              arcade: { debug: false }
+          },
+          scene: [MainScene]
+      };
+
+      const game = new Phaser.Game(config);
+      game.scene.start('MainScene', { playerId, session, playerName });
+      gameInstance.current = game;
+      setLoading(false);
     };
-    window.addEventListener('mousemove', handleMouseMove);
+
+    initGame();
 
     const handleResize = () => {
-      if (canvasRef.current) {
-        canvasRef.current.width = window.innerWidth;
-        canvasRef.current.height = window.innerHeight;
+      if (gameInstance.current) {
+          gameInstance.current.scale.resize(window.innerWidth, window.innerHeight);
       }
     };
     window.addEventListener('resize', handleResize);
-    handleResize(); // set initial size
-
-    let animationFrameId;
-    let lastPresenceSync = 0;
-    let lastFoodSpawn = 0;
-
-    const gameLoop = (timestamp) => {
-      if (isDead) {
-        renderDeathScreen();
-        animationFrameId = requestAnimationFrame(gameLoop);
-        return;
-      }
-
-      // --- PHYSICS / MOVEMENT ---
-      const canvas = canvasRef.current;
-      const hw = canvas.width / 2;
-      const hh = canvas.height / 2;
-
-      // Calculate direction vector from center of screen to mouse
-      let dx = mouse.current.x - hw;
-      let dy = mouse.current.y - hh;
-      const distToMouse = Math.hypot(dx, dy);
-
-      // Speed inversely proportional to radius
-      const speed = Math.max(1.5, 50 / Math.sqrt(myState.current.radius)); 
-
-      if (distToMouse > 10) {
-        // Normalize and scale
-        myState.current.x += (dx / distToMouse) * speed;
-        myState.current.y += (dy / distToMouse) * speed;
-      }
-
-      // Keep in bounds
-      myState.current.x = Math.max(myState.current.radius, Math.min(MAP_WIDTH - myState.current.radius, myState.current.x));
-      myState.current.y = Math.max(myState.current.radius, Math.min(MAP_HEIGHT - myState.current.radius, myState.current.y));
-
-      // --- FOOD COLLISION ---
-      for (let i = foods.current.length - 1; i >= 0; i--) {
-        const f = foods.current[i];
-        const dist = Math.hypot(myState.current.x - f.x, myState.current.y - f.y);
-        if (dist < myState.current.radius) {
-          foods.current.splice(i, 1);
-          // Increase area: new_radius = sqrt(r^2 + f_r^2)
-          myState.current.radius = Math.sqrt(myState.current.radius ** 2 + FOOD_RADIUS ** 2);
-          myState.current.score += 1;
-          channel.send({ type: 'broadcast', event: 'food_eaten', payload: { id: f.id } });
-        }
-      }
-
-      // --- EMPIRE COIN COLLISION ---
-      for (let i = empireCoins.current.length - 1; i >= 0; i--) {
-        const c = empireCoins.current[i];
-        const dist = Math.hypot(myState.current.x - c.x, myState.current.y - c.y);
-        if (dist < myState.current.radius) {
-          empireCoins.current.splice(i, 1);
-          myState.current.radius = Math.sqrt(myState.current.radius ** 2 + (EMPIRE_COIN_RADIUS*2) ** 2);
-          myState.current.score += 50;
-          channel.send({ type: 'broadcast', event: 'coin_eaten', payload: { id: c.id } });
-          
-          if (session) {
-            supabase.rpc('grant_points', { amount: 50 }).then(console.log).catch(console.error);
-          }
-        }
-      }
-
-      // --- PLAYER PVP COLLISION ---
-      for (const [otherId, p] of Object.entries(otherPlayers.current)) {
-        const dist = Math.hypot(myState.current.x - p.x, myState.current.y - p.y);
-        if (dist < myState.current.radius && myState.current.radius > p.radius * 1.15) {
-          // I ATE THEM!
-          myState.current.radius = Math.sqrt(myState.current.radius ** 2 + p.radius ** 2);
-          myState.current.score += p.score || 10;
-          channel.send({ type: 'broadcast', event: 'player_eaten', payload: { victimId: otherId } });
-          delete otherPlayers.current[otherId]; // Remove locally until presence updates
-        }
-      }
-
-      // --- AUTO SPAWN FOOD (if leader) ---
-      if (timestamp - lastFoodSpawn > 1000 && foods.current.length < MAX_FOOD) {
-        const f = spawnFood();
-        foods.current.push(f);
-        channel.send({ type: 'broadcast', event: 'food_spawn', payload: { food: f } });
-        lastFoodSpawn = timestamp;
-      }
-
-      // --- NETWORK SYNC ---
-      if (timestamp - lastPresenceSync > 100) {
-        channel.track({
-          x: myState.current.x,
-          y: myState.current.y,
-          radius: myState.current.radius,
-          color: myState.current.color,
-          name: myState.current.name,
-          score: myState.current.score
-        });
-        lastPresenceSync = timestamp;
-      }
-
-      renderGame();
-      animationFrameId = requestAnimationFrame(gameLoop);
-    };
-
-    const renderGame = () => {
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-      const hw = canvas.width / 2;
-      const hh = canvas.height / 2;
-
-      // Clear
-      ctx.fillStyle = '#0f172a'; // dark slate
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      ctx.save();
-      // Camera translation: Move world so player is at center
-      ctx.translate(hw - myState.current.x, hh - myState.current.y);
-
-      // Draw Grid
-      ctx.strokeStyle = '#1e293b';
-      ctx.lineWidth = 2;
-      const gridSize = 50;
-      for (let x = 0; x <= MAP_WIDTH; x += gridSize) {
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, MAP_HEIGHT); ctx.stroke();
-      }
-      for (let y = 0; y <= MAP_HEIGHT; y += gridSize) {
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(MAP_WIDTH, y); ctx.stroke();
-      }
-
-      // Draw Map Border
-      ctx.strokeStyle = '#ef4444';
-      ctx.lineWidth = 5;
-      ctx.strokeRect(0, 0, MAP_WIDTH, MAP_HEIGHT);
-
-      // Draw Food
-      foods.current.forEach(f => {
-        ctx.fillStyle = f.color;
-        ctx.beginPath();
-        ctx.arc(f.x, f.y, FOOD_RADIUS, 0, Math.PI * 2);
-        ctx.fill();
-      });
-
-      // Draw Empire Coins
-      empireCoins.current.forEach(c => {
-        ctx.fillStyle = '#fbbf24';
-        ctx.beginPath();
-        ctx.arc(c.x, c.y, EMPIRE_COIN_RADIUS, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.shadowBlur = 20;
-        ctx.shadowColor = '#fbbf24';
-        ctx.fill();
-        ctx.shadowBlur = 0;
-      });
-
-      // Draw Other Players
-      Object.values(otherPlayers.current).forEach(p => {
-        drawCell(ctx, p.x, p.y, p.radius, p.color, p.name, p.score);
-      });
-
-      // Draw Me
-      drawCell(ctx, myState.current.x, myState.current.y, myState.current.radius, myState.current.color, myState.current.name, myState.current.score);
-
-      ctx.restore();
-
-      // UI Overlay (Leaderboard)
-      renderLeaderboard(ctx);
-    };
-
-    const drawCell = (ctx, x, y, radius, color, name, score) => {
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(x, y, radius, 0, Math.PI * 2);
-      ctx.fill();
-      
-      // Glow
-      ctx.shadowBlur = 15;
-      ctx.shadowColor = color;
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-
-      // Text
-      ctx.fillStyle = '#fff';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      
-      const fontSize = Math.max(12, radius / 3);
-      ctx.font = `bold ${fontSize}px sans-serif`;
-      ctx.fillText(name || 'Unknown', x, y - fontSize/2);
-      
-      ctx.font = `${fontSize * 0.8}px sans-serif`;
-      ctx.fillText(score || 0, x, y + fontSize/2);
-    };
-
-    const renderLeaderboard = (ctx) => {
-      const canvas = canvasRef.current;
-      const allPlayers = [
-        { name: myState.current.name, score: myState.current.score },
-        ...Object.values(otherPlayers.current).map(p => ({ name: p.name, score: p.score }))
-      ];
-      allPlayers.sort((a, b) => b.score - a.score);
-      const top5 = allPlayers.slice(0, 5);
-
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-      ctx.fillRect(canvas.width - 220, 20, 200, 30 + top5.length * 25);
-      
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 16px sans-serif';
-      ctx.textAlign = 'left';
-      ctx.fillText('Leaderboard', canvas.width - 210, 45);
-
-      ctx.font = '14px sans-serif';
-      top5.forEach((p, idx) => {
-        ctx.fillText(`${idx + 1}. ${p.name}`, canvas.width - 210, 75 + idx * 25);
-        ctx.fillText(p.score, canvas.width - 60, 75 + idx * 25);
-      });
-    };
-
-    const renderDeathScreen = () => {
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = 'rgba(0,0,0,0.8)';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      
-      ctx.fillStyle = '#ff003c';
-      ctx.font = 'bold 60px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('YOU WERE EATEN', canvas.width/2, canvas.height/2 - 50);
-      
-      ctx.fillStyle = '#fff';
-      ctx.font = '20px sans-serif';
-      ctx.fillText('Click anywhere to respawn', canvas.width/2, canvas.height/2 + 20);
-    };
-
-    animationFrameId = requestAnimationFrame(gameLoop);
 
     return () => {
-      cancelAnimationFrame(animationFrameId);
-      window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('resize', handleResize);
-      supabase.removeChannel(channel);
+      if (gameInstance.current) {
+          gameInstance.current.destroy(true);
+          gameInstance.current = null;
+      }
     };
-  }, [playerId, session, isDead]);
+  }, []);
 
   return (
-    <div 
-      style={{ width: '100vw', height: '100vh', overflow: 'hidden', cursor: 'crosshair', position: 'relative' }}
-      onClick={() => isDead && respawn()}
-    >
-      {!session && (
+    <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden', background: '#000' }}>
+      {!session && !loading && (
         <div style={{ position: 'absolute', top: 20, left: 20, background: '#330000', color: '#ff003c', padding: '10px 20px', borderRadius: '4px', border: '1px solid #ff003c', zIndex: 10 }}>
           <strong>Warning:</strong> Guest Mode. Sign in via Headquarters to save Empire Points.
         </div>
       )}
-      <canvas ref={canvasRef} style={{ display: 'block' }} />
+      <div ref={gameContainer} style={{ width: '100%', height: '100%' }} />
     </div>
   );
 };
