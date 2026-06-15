@@ -43,18 +43,30 @@ export class ArenaRoom extends Room<any> {
        const target = this.state.players.get(targetId);
        if (target && !target.isDead) {
            target.hp -= 25;
+           
+           // Knockback mechanic
+           if (payload.angle !== undefined) {
+               target.x += Math.cos(payload.angle) * 150;
+               target.y += Math.sin(payload.angle) * 150;
+           }
+
            if (target.hp <= 0) {
                target.isDead = true;
-               target.sessionMass = 0;
-               target.hp = 100; // Reset for next spawn
+               
+               // Drop a massive loot pile based on their unsecured loot
+               const drops = Math.min(10, 1 + Math.floor(target.unsecuredLoot / 50));
+               for(let i=0; i<drops; i++) {
+                   const coinId = crypto.randomUUID();
+                   const coin = new Coin();
+                   coin.x = target.x + (Math.random() * 100 - 50);
+                   coin.y = target.y + (Math.random() * 100 - 50);
+                   coin.value = 2; // high value drop
+                   this.state.coins.set(coinId, coin);
+               }
 
-               // Drop a coin
-               const coinId = crypto.randomUUID();
-               const coin = new Coin();
-               coin.x = target.x;
-               coin.y = target.y;
-               coin.value = 2; // high value drop
-               this.state.coins.set(coinId, coin);
+               target.sessionMass = 0;
+               target.unsecuredLoot = 0;
+               target.hp = 100; // Reset for next spawn
 
                // Let client know they died
                const targetClient = this.clients.find(c => c.sessionId === targetId);
@@ -183,16 +195,49 @@ export class ArenaRoom extends Room<any> {
             const dist = Math.sqrt(dx * dx + dy * dy);
 
             if (dist < radius) {
-                // Collect coin
+                // Collect coin - Add to UNSECURED loot
                 this.state.coins.delete(coinId);
                 player.sessionMass += 50 * coin.value;
-                
-                // Trigger Secure RPC call (Fire & Forget)
-                // In production, we'd look up the user's Supabase UUID based on sessionId.
-                // For now, we mock it.
-                // supabase.rpc('grant_points', { amount: 50 * coin.value }).catch(console.error);
+                player.unsecuredLoot += 50 * coin.value;
             }
         });
+
+        // 4. Warp Gate Extraction Logic
+        const gateDist = Math.sqrt(Math.pow(player.x - this.state.warpGate.x, 2) + Math.pow(player.y - this.state.warpGate.y, 2));
+        if (gateDist < this.state.warpGate.radius) {
+            player.isExtracting = true;
+            player.extractionTimer += (deltaTime / 1000);
+
+            if (player.extractionTimer >= 3.0) {
+                // Successful Extraction!
+                if (player.unsecuredLoot > 0) {
+                    // Fire secure RPC
+                    supabase.rpc('grant_points', { amount: player.unsecuredLoot }).then(({error}) => {
+                        if (error) console.error(error);
+                    });
+                }
+
+                // Reset and Teleport
+                player.unsecuredLoot = 0;
+                player.sessionMass = 0;
+                player.extractionTimer = 0;
+                player.isExtracting = false;
+
+                // Teleport to edge of map
+                player.x = Math.random() > 0.5 ? 200 : MAP_WIDTH - 200;
+                player.y = Math.random() > 0.5 ? 200 : MAP_HEIGHT - 200;
+
+                // Tell client they extracted
+                const targetClient = this.clients.find(c => c.sessionId === sessionId);
+                if (targetClient) {
+                    targetClient.send("extracted");
+                }
+            }
+        } else {
+            // Not in radius, reset timer
+            player.isExtracting = false;
+            player.extractionTimer = 0;
+        }
     });
   }
 }

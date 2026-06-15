@@ -10,6 +10,9 @@ export class Player extends Schema {
   @type("string") name: string = "";
   @type("boolean") isDead: boolean = false;
   @type("uint32") lastProcessedSequence: number = 0;
+  @type("uint16") unsecuredLoot: number = 0;
+  @type("boolean") isExtracting: boolean = false;
+  @type("number") extractionTimer: number = 0;
 }
 
 export class Coin extends Schema {
@@ -24,8 +27,15 @@ export class Asteroid extends Schema {
   @type("uint8") size: number = 1;
 }
 
+export class WarpGate extends Schema {
+  @type("number") x: number = 2000;
+  @type("number") y: number = 2000;
+  @type("number") radius: number = 250;
+}
+
 export class ArenaState extends Schema {
   @type({ map: Player }) players = new MapSchema<Player>();
   @type({ map: Coin }) coins = new MapSchema<Coin>();
   @type({ map: Asteroid }) asteroids = new MapSchema<Asteroid>();
+  @type(WarpGate) warpGate = new WarpGate();
 }

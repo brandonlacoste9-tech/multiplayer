@@ -26,6 +26,7 @@ class MainScene extends Phaser.Scene {
             hp: 100,
             score: 0,
             session_score: 0,
+            unsecuredLoot: 0,
             x: 0,
             y: 0,
             rotation: 0
@@ -63,6 +64,29 @@ class MainScene extends Phaser.Scene {
         
         // Tiling background
         this.bg = this.add.tileSprite(MAP_WIDTH/2, MAP_HEIGHT/2, MAP_WIDTH, MAP_HEIGHT, 'bg');
+
+        // Draw Warp Gate
+        const gateX = 2000;
+        const gateY = 2000;
+        const gateRadius = 250;
+        
+        // Gate Aura
+        const gateGraphics = this.add.graphics();
+        gateGraphics.lineStyle(4, 0x8b5cf6, 0.5);
+        gateGraphics.strokeCircle(gateX, gateY, gateRadius);
+        gateGraphics.fillStyle(0x8b5cf6, 0.1);
+        gateGraphics.fillCircle(gateX, gateY, gateRadius);
+
+        // Gate Particles
+        this.gateEmitter = this.add.particles(gateX, gateY, 'spark', {
+            speed: { min: 20, max: 100 },
+            angle: { min: 0, max: 360 },
+            scale: { start: 0.8, end: 0 },
+            blendMode: 'ADD',
+            tint: 0x8b5cf6,
+            lifespan: 2000,
+            frequency: 50
+        });
         
         // Create Player
         const startX = Phaser.Math.Between(100, MAP_WIDTH - 100);
@@ -103,10 +127,16 @@ class MainScene extends Phaser.Scene {
         this.input.on('pointerdown', () => this.shootLaser());
 
         // UI
-        this.scoreText = this.add.text(20, 20, `Score: 0`, { fontSize: '24px', fill: '#fff', fontStyle: 'bold' }).setScrollFactor(0).setDepth(100);
-        this.hpText = this.add.text(20, 50, `HP: 100`, { fontSize: '24px', fill: '#00ffaa', fontStyle: 'bold' }).setScrollFactor(0).setDepth(100);
+        this.scoreText = this.add.text(20, 20, `Banked: 0`, { fontSize: '24px', fill: '#0ea5e9', fontStyle: 'bold' }).setScrollFactor(0).setDepth(100);
+        this.lootText = this.add.text(20, 50, `Unsecured Loot: 0`, { fontSize: '24px', fill: '#f97316', fontStyle: 'bold' }).setScrollFactor(0).setDepth(100);
+        this.hpText = this.add.text(20, 80, `HP: 100`, { fontSize: '24px', fill: '#00ffaa', fontStyle: 'bold' }).setScrollFactor(0).setDepth(100);
 
-        this.deathText = this.add.text(this.cameras.main.width/2, this.cameras.main.height/2, 'SHIP DESTROYED\nClick to Respawn', {
+        // Extraction Progress UI
+        this.extractText = this.add.text(this.cameras.main.width/2, 100, 'EXTRACTING...', { fontSize: '32px', fill: '#c084fc', fontStyle: 'bold' }).setOrigin(0.5).setScrollFactor(0).setVisible(false).setDepth(100);
+        this.extractBarBg = this.add.rectangle(this.cameras.main.width/2, 140, 300, 20, 0x000000).setScrollFactor(0).setVisible(false).setDepth(100);
+        this.extractBarFill = this.add.rectangle(this.cameras.main.width/2 - 150, 140, 0, 20, 0xc084fc).setOrigin(0, 0.5).setScrollFactor(0).setVisible(false).setDepth(100);
+
+        this.deathText = this.add.text(this.cameras.main.width/2, this.cameras.main.height/2, 'SHIP DESTROYED\nLoot Dropped\nClick to Respawn', {
             fontSize: '40px', fill: '#ff003c', align: 'center', backgroundColor: 'rgba(0,0,0,0.8)', padding: { x: 20, y: 20 }
         }).setOrigin(0.5).setScrollFactor(0).setVisible(false).setInteractive().setDepth(100);
         
@@ -139,7 +169,24 @@ class MainScene extends Phaser.Scene {
                         this.myState.hp = player.hp;
                         this.hpText.setText(`HP: ${this.myState.hp}`);
                         this.myState.session_score = player.sessionMass;
+                        this.myState.unsecuredLoot = player.unsecuredLoot;
+                        this.lootText.setText(`Unsecured Loot: ${this.myState.unsecuredLoot}`);
                         this.updateScale();
+
+                        // Update Extraction UI
+                        if (player.isExtracting) {
+                            this.extractText.setVisible(true);
+                            this.extractBarBg.setVisible(true);
+                            this.extractBarFill.setVisible(true);
+                            const progress = Math.min(1, player.extractionTimer / 3.0);
+                            this.extractBarFill.width = 300 * progress;
+                            this.player.setTint(0xc084fc); // Purple extracting aura
+                        } else {
+                            this.extractText.setVisible(false);
+                            this.extractBarBg.setVisible(false);
+                            this.extractBarFill.setVisible(false);
+                            this.player.clearTint();
+                        }
 
                         // CSP Reconciliation
                         this.player.x = player.x;
@@ -183,6 +230,11 @@ class MainScene extends Phaser.Scene {
                             s.serverX = player.x;
                             s.serverY = player.y;
                             s.rotation = player.rotation;
+                            if (player.isExtracting) {
+                                s.setTint(0xc084fc);
+                            } else {
+                                s.clearTint();
+                            }
                         }
                     });
                 }
@@ -225,6 +277,11 @@ class MainScene extends Phaser.Scene {
 
             this.room.onMessage("you_died", () => {
                 this.die();
+            });
+
+            this.room.onMessage("extracted", () => {
+                // Flash the screen green!
+                this.cameras.main.flash(500, 14, 165, 233);
             });
 
         } catch (e) {
@@ -308,8 +365,15 @@ class MainScene extends Phaser.Scene {
 
         this.myState.score = 0;
         this.myState.session_score = 0;
+        this.myState.unsecuredLoot = 0;
         this.player.setScale(1); // reset snowball mass
-        this.scoreText.setText(`Score: 0`);
+        this.lootText.setText(`Unsecured Loot: 0`);
+        
+        // Hide extraction UI
+        this.extractText.setVisible(false);
+        this.extractBarBg.setVisible(false);
+        this.extractBarFill.setVisible(false);
+        this.player.clearTint();
     }
 
     respawn() {
@@ -397,10 +461,8 @@ class MainScene extends Phaser.Scene {
                 this.takeDamage();
                 
                 // Inform server that we took a laser hit from this client
-                // In a perfect world, the server checks the laser hitbox itself.
-                // Since this is rapid arcade, we can tell server we got hit.
                 if (this.room) {
-                    this.room.send("laser_hit", { targetId: this.room.sessionId });
+                    this.room.send("laser_hit", { targetId: this.room.sessionId, angle: laser.rotation });
                 }
             }
         }
