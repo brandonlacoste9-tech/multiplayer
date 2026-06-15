@@ -1,10 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Phaser from 'phaser';
 import { createClient } from '@supabase/supabase-js';
+import * as Colyseus from 'colyseus.js';
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://eurrfbiavliahmhdxybp.supabase.co';
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV1cnJmYmlhdmxpYWhtaGR4eWJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEyMDYyMTUsImV4cCI6MjA5Njc4MjIxNX0.hW7E5Z-02WTBiezSjUzjIBjfMc3OgYexFlvzlgJO3p0';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const COLYSEUS_URL = import.meta.env.VITE_COLYSEUS_URL || 'ws://localhost:2567';
 
 const MAP_WIDTH = 4000;
 const MAP_HEIGHT = 4000;
@@ -29,14 +31,15 @@ class MainScene extends Phaser.Scene {
             rotation: 0
         };
         
-        this.otherPlayersData = {};
         this.otherPlayersSprites = {};
         this.otherPlayersLasers = {};
         this.empireCoins = {};
         
-        this.lastPresenceSync = 0;
-        this.lastCoinSpawn = 0;
         this.isDead = false;
+        
+        // Client-Side Prediction State
+        this.currentSequenceNumber = 0;
+        this.inputHistory = [];
     }
 
     preload() {
@@ -117,61 +120,116 @@ class MainScene extends Phaser.Scene {
         this.setupRealtime();
     }
 
-    setupRealtime() {
-        this.channel = supabase.channel('empire_space', {
-            config: { presence: { key: this.playerId } }
-        });
+    async setupRealtime() {
+        const client = new Colyseus.Client(COLYSEUS_URL);
+        try {
+            this.room = await client.joinOrCreate("arena", { name: this.playerName });
+            console.log("Joined Colyseus Room!", this.room.sessionId);
 
-        this.channel.on('presence', { event: 'sync' }, () => {
-            const state = this.channel.presenceState();
-            this.otherPlayersData = {};
-            for (const [key, presences] of Object.entries(state)) {
-                if (key !== this.playerId && presences.length > 0) {
-                    this.otherPlayersData[key] = presences[0];
+            this.room.state.players.onAdd((player, sessionId) => {
+                if (sessionId === this.room.sessionId) {
+                    // It's me! Snap to initial server spawn
+                    this.player.x = player.x;
+                    this.player.y = player.y;
+
+                    player.onChange(() => {
+                        if (player.isDead && !this.isDead) this.die();
+                        else if (!player.isDead && this.isDead) this.respawn();
+
+                        this.myState.hp = player.hp;
+                        this.hpText.setText(`HP: ${this.myState.hp}`);
+                        this.myState.session_score = player.sessionMass;
+                        this.updateScale();
+
+                        // CSP Reconciliation
+                        this.player.x = player.x;
+                        this.player.y = player.y;
+
+                        // Filter processed inputs
+                        this.inputHistory = this.inputHistory.filter(i => i.seq > player.lastProcessedSequence);
+                        
+                        // Re-apply remaining
+                        this.inputHistory.forEach(input => {
+                            let speed = 300;
+                            if (input.shift && this.myState.session_score > 0) speed = 600;
+                            let vx = 0;
+                            let vy = 0;
+                            if (input.left) vx = -speed;
+                            if (input.right) vx = speed;
+                            if (input.up) vy = -speed;
+                            if (input.down) vy = speed;
+
+                            this.player.x += vx * (input.dt / 1000);
+                            this.player.y += vy * (input.dt / 1000);
+                        });
+                    });
+                } else {
+                    // Enemy
+                    const s = this.add.sprite(player.x, player.y, 'enemy');
+                    s.setDepth(9);
+                    const nt = this.add.text(player.x, player.y + 40, player.name, { fontSize: '14px', fill: '#ff003c', fontStyle: 'bold' }).setOrigin(0.5).setDepth(10);
+                    s.nameText = nt;
+                    s.serverX = player.x;
+                    s.serverY = player.y;
+                    this.otherPlayersSprites[sessionId] = s;
+
+                    player.onChange(() => {
+                        if (player.isDead) {
+                            s.setVisible(false);
+                            s.nameText.setVisible(false);
+                        } else {
+                            s.setVisible(true);
+                            s.nameText.setVisible(true);
+                            s.serverX = player.x;
+                            s.serverY = player.y;
+                            s.rotation = player.rotation;
+                        }
+                    });
                 }
-            }
-        });
+            });
 
-        this.channel.on('broadcast', { event: 'laser_fired' }, (payload) => {
-            const { x, y, rotation } = payload.payload;
-            const laser = this.physics.add.sprite(x, y, 'bullet');
-            laser.setRotation(rotation);
-            laser.setDepth(5);
-            this.physics.velocityFromRotation(rotation - Math.PI/2, 600, laser.body.velocity);
-            
-            // Add to physics group so we can check if it hits US
-            this.otherPlayersLasers[payload.payload.laserId] = laser;
-            setTimeout(() => {
-                if(laser) laser.destroy();
-                delete this.otherPlayersLasers[payload.payload.laserId];
-            }, 2000); // laser expires
-        });
-
-        this.channel.on('broadcast', { event: 'coin_spawn' }, (payload) => {
-            this.spawnCoin(payload.payload.coin);
-        });
-
-        this.channel.on('broadcast', { event: 'coin_collected' }, (payload) => {
-            const id = payload.payload.id;
-            if (this.empireCoins[id]) {
-                this.empireCoins[id].destroy();
-                delete this.empireCoins[id];
-            }
-        });
-
-        this.channel.subscribe(async (status) => {
-            if (status === 'SUBSCRIBED') {
-                await this.syncPresence();
-                if (Object.keys(this.empireCoins).length === 0) {
-                    // Leader spawns initial coins
-                    for(let i=0; i<15; i++) {
-                        const c = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(100, MAP_WIDTH-100), y: Phaser.Math.Between(100, MAP_HEIGHT-100) };
-                        this.spawnCoin(c);
-                        this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: c } });
-                    }
+            this.room.state.players.onRemove((player, sessionId) => {
+                if (this.otherPlayersSprites[sessionId]) {
+                    this.otherPlayersSprites[sessionId].destroy();
+                    this.otherPlayersSprites[sessionId].nameText.destroy();
+                    delete this.otherPlayersSprites[sessionId];
                 }
-            }
-        });
+            });
+
+            this.room.state.coins.onAdd((coin, coinId) => {
+                const sprite = this.add.sprite(coin.x, coin.y, 'coin');
+                sprite.setDepth(8);
+                this.tweens.add({ targets: sprite, scaleX: 1.5, scaleY: 1.5, yoyo: true, repeat: -1, duration: 500 });
+                this.empireCoins[coinId] = sprite;
+            });
+
+            this.room.state.coins.onRemove((coin, coinId) => {
+                if (this.empireCoins[coinId]) {
+                    this.empireCoins[coinId].destroy();
+                    delete this.empireCoins[coinId];
+                }
+            });
+
+            this.room.onMessage("laser_fired", (payload) => {
+                const laser = this.physics.add.sprite(payload.x, payload.y, 'bullet');
+                laser.setRotation(payload.rotation);
+                laser.setDepth(5);
+                this.physics.velocityFromRotation(payload.rotation - Math.PI/2, 600, laser.body.velocity);
+                
+                this.otherPlayersLasers[payload.laserId] = laser;
+                setTimeout(() => {
+                    if(laser) laser.destroy();
+                    delete this.otherPlayersLasers[payload.laserId];
+                }, 2000);
+            });
+
+            this.room.onMessage("you_died", () => {
+                this.die();
+            });
+
+        } catch (e) {
+            console.error("JOIN ERROR", e);
+        }
     }
 
     spawnCoin(data) {
@@ -195,11 +253,9 @@ class MainScene extends Phaser.Scene {
                 this.physics.velocityFromRotation(angle - Math.PI/2, 600, laser.body.velocity);
                 
                 const laserId = Phaser.Math.RND.uuid();
-                this.channel.send({
-                    type: 'broadcast',
-                    event: 'laser_fired',
-                    payload: { laserId, x: this.player.x, y: this.player.y, rotation: angle }
-                });
+                if (this.room) {
+                    this.room.send('laser_fired', { laserId, x: this.player.x, y: this.player.y, rotation: angle });
+                }
 
                 setTimeout(() => { if(laser) laser.destroy(); }, 2000);
             });
@@ -233,6 +289,7 @@ class MainScene extends Phaser.Scene {
     }
 
     die() {
+        if (this.isDead) return;
         this.isDead = true;
         this.player.setVisible(false);
         this.player.body.stop();
@@ -240,7 +297,6 @@ class MainScene extends Phaser.Scene {
         this.exhaustEmitter.emitting = false;
         this.cameras.main.shake(300, 0.04);
 
-        // Explosion Particles
         this.add.particles(this.player.x, this.player.y, 'spark', {
             speed: { min: 50, max: 300 },
             scale: { start: 1, end: 0 },
@@ -250,90 +306,73 @@ class MainScene extends Phaser.Scene {
             duration: 50
         });
 
-        // Spawn a coin where we died as loot
-        const drop = { id: Phaser.Math.RND.uuid(), x: this.player.x, y: this.player.y };
-        this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: drop } });
-
         this.myState.score = 0;
         this.myState.session_score = 0;
         this.player.setScale(1); // reset snowball mass
         this.scoreText.setText(`Score: 0`);
-        this.syncPresence(); // Sync dead state
     }
 
     respawn() {
         this.isDead = false;
         this.myState.hp = 100;
-        this.player.x = Phaser.Math.Between(100, MAP_WIDTH-100);
-        this.player.y = Phaser.Math.Between(100, MAP_HEIGHT-100);
         this.player.setVisible(true);
         this.deathText.setVisible(false);
         this.hpText.setText(`HP: 100`);
-        this.syncPresence();
     }
 
-    syncPresence() {
-        if (!this.channel) return;
-        this.channel.track({
-            x: this.player.x,
-            y: this.player.y,
-            rotation: this.player.rotation,
-            name: this.playerName,
-            isDead: this.isDead
-        });
-    }
+    update(time, delta) {
+        if (!this.isDead && this.room) {
+            // Rotation (face mouse)
+            const pointer = this.input.activePointer;
+            const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
+            this.player.rotation = Phaser.Math.Angle.Between(this.player.x, this.player.y, worldPoint.x, worldPoint.y) + Math.PI/2;
 
-    update(time) {
-        if (!this.isDead) {
-            // Dash Mechanic
+            // Gather inputs
+            const inputState = {
+                left: this.wasd.a.isDown || this.cursors.left.isDown,
+                right: this.wasd.d.isDown || this.cursors.right.isDown,
+                up: this.wasd.w.isDown || this.cursors.up.isDown,
+                down: this.wasd.s.isDown || this.cursors.down.isDown,
+                shift: this.wasd.shift.isDown,
+                rotation: this.player.rotation,
+                seq: ++this.currentSequenceNumber,
+                dt: delta
+            };
+
+            // Send to server
+            this.room.send("input", inputState);
+
+            // Store in history
+            this.inputHistory.push(inputState);
+
+            // Predict local movement (CSP)
             let speed = 300;
-            if (this.wasd.shift.isDown && this.myState.session_score > 0) {
+            if (inputState.shift && this.myState.session_score > 0) {
                 speed = 600;
-                // Drain score at 10 points per second (1 point per 100ms)
+                // We drain locally just for prediction, server has authority
                 if (time % 100 < 20) {
                     this.myState.session_score = Math.max(0, this.myState.session_score - 1);
                     this.updateScale();
                 }
             }
 
-            // Movement
             let vx = 0;
             let vy = 0;
-            
-            if (this.wasd.a.isDown || this.cursors.left.isDown) vx = -speed;
-            if (this.wasd.d.isDown || this.cursors.right.isDown) vx = speed;
-            if (this.wasd.w.isDown || this.cursors.up.isDown) vy = -speed;
-            if (this.wasd.s.isDown || this.cursors.down.isDown) vy = speed;
+            if (inputState.left) vx = -speed;
+            if (inputState.right) vx = speed;
+            if (inputState.up) vy = -speed;
+            if (inputState.down) vy = speed;
             
             this.player.setVelocity(vx, vy);
 
             if (vx !== 0 || vy !== 0) {
                 this.exhaustEmitter.emitting = true;
                 const shipAngleDeg = Phaser.Math.RadToDeg(this.player.rotation);
-                const exhaustAngle = shipAngleDeg + 90; // +90 because our sprite faces up but rotation logic is +90 offset
+                const exhaustAngle = shipAngleDeg + 90;
                 this.exhaustEmitter.particleAngle = { min: exhaustAngle - 15, max: exhaustAngle + 15 };
             } else {
                 this.exhaustEmitter.emitting = false;
             }
-
-            // Rotation (face mouse)
-            const pointer = this.input.activePointer;
-            const worldPoint = this.cameras.main.getWorldPoint(pointer.x, pointer.y);
-            this.player.rotation = Phaser.Math.Angle.Between(this.player.x, this.player.y, worldPoint.x, worldPoint.y) + Math.PI/2;
-
-            // Sync
-            if (time - this.lastPresenceSync > 50) { // 20 FPS sync
-                this.syncPresence();
-                this.lastPresenceSync = time;
-            }
-        }
-
-        // Auto spawn coins
-        if (time - this.lastCoinSpawn > 3000 && Object.keys(this.empireCoins).length < MAX_COINS) {
-            const c = { id: Phaser.Math.RND.uuid(), x: Phaser.Math.Between(100, MAP_WIDTH-100), y: Phaser.Math.Between(100, MAP_HEIGHT-100) };
-            this.spawnCoin(c);
-            this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: c } });
-            this.lastCoinSpawn = time;
         }
 
         this.checkCollisions();
@@ -352,67 +391,30 @@ class MainScene extends Phaser.Scene {
         // Check if other players lasers hit ME
         for (const [id, laser] of Object.entries(this.otherPlayersLasers)) {
             if (Phaser.Math.Distance.Between(this.player.x, this.player.y, laser.x, laser.y) < 30) {
-                // I got hit!
+                // I got hit! Let the server validate the hit.
                 laser.destroy();
                 delete this.otherPlayersLasers[id];
                 this.takeDamage();
-            }
-        }
-
-        // Check if I collected a coin
-        for (const [id, coin] of Object.entries(this.empireCoins)) {
-            // Collision radius scales with player size
-            const collisionRadius = 40 * this.player.scale;
-            if (Phaser.Math.Distance.Between(this.player.x, this.player.y, coin.x, coin.y) < collisionRadius) {
-                coin.destroy();
-                delete this.empireCoins[id];
-                this.myState.score += 50;
-                this.myState.session_score += 50;
-                this.updateScale();
                 
-                this.scoreText.setText(`Score: ${this.myState.score}`);
-                this.channel.send({ type: 'broadcast', event: 'coin_collected', payload: { id } });
-                
-                if (this.session) {
-                    supabase.rpc('grant_points', { amount: 50 }).then(console.log).catch(console.error);
+                // Inform server that we took a laser hit from this client
+                // In a perfect world, the server checks the laser hitbox itself.
+                // Since this is rapid arcade, we can tell server we got hit.
+                if (this.room) {
+                    this.room.send("laser_hit", { targetId: this.room.sessionId });
                 }
             }
         }
+        
+        // Coins are collected directly via server authority now. 
+        // We do NOT send coin_collected broadcasts locally.
     }
 
     updateOtherPlayers() {
-        // Remove disconnected
-        for (const id in this.otherPlayersSprites) {
-            if (!this.otherPlayersData[id]) {
-                this.otherPlayersSprites[id].destroy();
-                this.otherPlayersSprites[id].nameText.destroy();
-                delete this.otherPlayersSprites[id];
-            }
-        }
-
-        // Add/Update existing
-        for (const [id, pData] of Object.entries(this.otherPlayersData)) {
-            if (!this.otherPlayersSprites[id]) {
-                const s = this.add.sprite(pData.x, pData.y, 'enemy');
-                s.setDepth(9);
-                const nt = this.add.text(pData.x, pData.y + 40, pData.name, { fontSize: '14px', fill: '#ff003c', fontStyle: 'bold' }).setOrigin(0.5).setDepth(10);
-                s.nameText = nt;
-                this.otherPlayersSprites[id] = s;
-            }
-
-            const sprite = this.otherPlayersSprites[id];
-            
-            if (pData.isDead) {
-                sprite.setVisible(false);
-                sprite.nameText.setVisible(false);
-            } else {
-                sprite.setVisible(true);
-                sprite.nameText.setVisible(true);
-                // Lerp position
-                sprite.x = Phaser.Math.Linear(sprite.x, pData.x, 0.4);
-                sprite.y = Phaser.Math.Linear(sprite.y, pData.y, 0.4);
-                // Hard set rotation
-                sprite.rotation = pData.rotation;
+        for (const [id, sprite] of Object.entries(this.otherPlayersSprites)) {
+            // Smoothly Lerp to server's target coordinates
+            if (sprite.serverX !== undefined && sprite.serverY !== undefined) {
+                sprite.x = Phaser.Math.Linear(sprite.x, sprite.serverX, 0.3);
+                sprite.y = Phaser.Math.Linear(sprite.y, sprite.serverY, 0.3);
                 sprite.nameText.setPosition(sprite.x, sprite.y + 40);
             }
         }
