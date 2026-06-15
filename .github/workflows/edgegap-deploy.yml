@@ -1,0 +1,28 @@
+name: Deploy to Edgegap
+
+on:
+  push:
+    branches:
+      - main
+    # Only trigger when the server code changes
+    paths:
+      - 'server/**'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Deploy to Edgegap
+        uses: edgegap/action-deploy@v1
+        with:
+          edgegap_token: ${{ secrets.EDGEGAP_TOKEN }}
+          app_name: "empire-flagship"
+          version_name: ${{ github.sha }}
+          # We tell it where our server code and Dockerfile live
+          path: "./server"
+          dockerfile: "Dockerfile"
+          image_name: "empire-flagship-server"
+          registry: "edgegap" # Use Edgegap's private registry natively
