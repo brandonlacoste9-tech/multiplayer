@@ -23,6 +23,7 @@ class MainScene extends Phaser.Scene {
         this.myState = {
             hp: 100,
             score: 0,
+            session_score: 0,
             x: 0,
             y: 0,
             rotation: 0
@@ -44,6 +45,7 @@ class MainScene extends Phaser.Scene {
         this.load.image('ship', '/assets/images/foozle/fighter.png');
         this.load.image('enemy', '/assets/images/foozle/scout.png');
         this.load.image('bullet', '/assets/images/foozle/bullet.png');
+        this.load.image('spark', '/assets/images/foozle/ship_engine_thruster.png');
         // We will generate a coin texture since the repo might not have a golden coin
         const g = this.add.graphics();
         g.fillStyle(0xfbbf24, 1);
@@ -69,6 +71,17 @@ class MainScene extends Phaser.Scene {
         this.player.setCollideWorldBounds(true);
         this.player.setDepth(10);
         
+        // Exhaust Particles
+        this.exhaustEmitter = this.add.particles(0, 0, 'spark', {
+            speed: { min: 100, max: 200 },
+            scale: { start: 0.6, end: 0 },
+            alpha: { start: 1, end: 0 },
+            blendMode: 'ADD',
+            lifespan: 400,
+            emitting: false
+        });
+        this.exhaustEmitter.startFollow(this.player);
+        
         // Camera Follow
         this.cameras.main.startFollow(this.player, true, 0.1, 0.1);
         
@@ -78,7 +91,8 @@ class MainScene extends Phaser.Scene {
             w: this.input.keyboard.addKey('W'),
             a: this.input.keyboard.addKey('A'),
             s: this.input.keyboard.addKey('S'),
-            d: this.input.keyboard.addKey('D')
+            d: this.input.keyboard.addKey('D'),
+            shift: this.input.keyboard.addKey('SHIFT')
         };
         
         // Shooting
@@ -172,27 +186,46 @@ class MainScene extends Phaser.Scene {
     shootLaser() {
         if (this.isDead) return;
         
-        // Ship points to mouse, laser shoots from nose
-        const laser = this.physics.add.sprite(this.player.x, this.player.y, 'bullet');
-        laser.setRotation(this.player.rotation);
-        laser.setDepth(5);
-        this.physics.velocityFromRotation(this.player.rotation - Math.PI/2, 600, laser.body.velocity);
-        
-        const laserId = Phaser.Math.RND.uuid();
-        this.channel.send({
-            type: 'broadcast',
-            event: 'laser_fired',
-            payload: { laserId, x: this.player.x, y: this.player.y, rotation: this.player.rotation }
-        });
+        const spawnLasers = (offsetAngles) => {
+            offsetAngles.forEach(offset => {
+                const laser = this.physics.add.sprite(this.player.x, this.player.y, 'bullet');
+                const angle = this.player.rotation + offset;
+                laser.setRotation(angle);
+                laser.setDepth(5);
+                this.physics.velocityFromRotation(angle - Math.PI/2, 600, laser.body.velocity);
+                
+                const laserId = Phaser.Math.RND.uuid();
+                this.channel.send({
+                    type: 'broadcast',
+                    event: 'laser_fired',
+                    payload: { laserId, x: this.player.x, y: this.player.y, rotation: angle }
+                });
 
-        setTimeout(() => { if(laser) laser.destroy(); }, 2000);
+                setTimeout(() => { if(laser) laser.destroy(); }, 2000);
+            });
+        };
+
+        if (this.myState.session_score > 500) {
+            spawnLasers([0, -0.2, 0.2]); // Spread shot
+        } else if (this.myState.session_score > 200) {
+            spawnLasers([-0.1, 0.1]); // Twin shot
+        } else {
+            spawnLasers([0]); // Single
+        }
     }
 
     takeDamage() {
         if (this.isDead) return;
         this.myState.hp -= 25;
         this.hpText.setText(`HP: ${this.myState.hp}`);
-        this.cameras.main.shake(100, 0.02);
+        this.cameras.main.shake(100, 0.01);
+        
+        this.player.setTintFill(0xffffff);
+        this.time.delayedCall(50, () => {
+            if (this.player && this.player.active) {
+                this.player.clearTint();
+            }
+        });
         
         if (this.myState.hp <= 0) {
             this.die();
@@ -204,12 +237,26 @@ class MainScene extends Phaser.Scene {
         this.player.setVisible(false);
         this.player.body.stop();
         this.deathText.setVisible(true);
+        this.exhaustEmitter.emitting = false;
+        this.cameras.main.shake(300, 0.04);
+
+        // Explosion Particles
+        this.add.particles(this.player.x, this.player.y, 'spark', {
+            speed: { min: 50, max: 300 },
+            scale: { start: 1, end: 0 },
+            blendMode: 'ADD',
+            lifespan: 500,
+            quantity: 30,
+            duration: 50
+        });
 
         // Spawn a coin where we died as loot
         const drop = { id: Phaser.Math.RND.uuid(), x: this.player.x, y: this.player.y };
         this.channel.send({ type: 'broadcast', event: 'coin_spawn', payload: { coin: drop } });
 
         this.myState.score = 0;
+        this.myState.session_score = 0;
+        this.player.setScale(1); // reset snowball mass
         this.scoreText.setText(`Score: 0`);
         this.syncPresence(); // Sync dead state
     }
@@ -238,8 +285,18 @@ class MainScene extends Phaser.Scene {
 
     update(time) {
         if (!this.isDead) {
+            // Dash Mechanic
+            let speed = 300;
+            if (this.wasd.shift.isDown && this.myState.session_score > 0) {
+                speed = 600;
+                // Drain score at 10 points per second (1 point per 100ms)
+                if (time % 100 < 20) {
+                    this.myState.session_score = Math.max(0, this.myState.session_score - 1);
+                    this.updateScale();
+                }
+            }
+
             // Movement
-            const speed = 300;
             let vx = 0;
             let vy = 0;
             
@@ -249,6 +306,15 @@ class MainScene extends Phaser.Scene {
             if (this.wasd.s.isDown || this.cursors.down.isDown) vy = speed;
             
             this.player.setVelocity(vx, vy);
+
+            if (vx !== 0 || vy !== 0) {
+                this.exhaustEmitter.emitting = true;
+                const shipAngleDeg = Phaser.Math.RadToDeg(this.player.rotation);
+                const exhaustAngle = shipAngleDeg + 90; // +90 because our sprite faces up but rotation logic is +90 offset
+                this.exhaustEmitter.particleAngle = { min: exhaustAngle - 15, max: exhaustAngle + 15 };
+            } else {
+                this.exhaustEmitter.emitting = false;
+            }
 
             // Rotation (face mouse)
             const pointer = this.input.activePointer;
@@ -274,6 +340,12 @@ class MainScene extends Phaser.Scene {
         this.updateOtherPlayers();
     }
 
+    updateScale() {
+        // Max scale 2.5x at 1000 score
+        const newScale = Math.min(2.5, 1 + (this.myState.session_score / 600));
+        this.player.setScale(newScale);
+    }
+
     checkCollisions() {
         if (this.isDead) return;
 
@@ -289,10 +361,15 @@ class MainScene extends Phaser.Scene {
 
         // Check if I collected a coin
         for (const [id, coin] of Object.entries(this.empireCoins)) {
-            if (Phaser.Math.Distance.Between(this.player.x, this.player.y, coin.x, coin.y) < 40) {
+            // Collision radius scales with player size
+            const collisionRadius = 40 * this.player.scale;
+            if (Phaser.Math.Distance.Between(this.player.x, this.player.y, coin.x, coin.y) < collisionRadius) {
                 coin.destroy();
                 delete this.empireCoins[id];
                 this.myState.score += 50;
+                this.myState.session_score += 50;
+                this.updateScale();
+                
                 this.scoreText.setText(`Score: ${this.myState.score}`);
                 this.channel.send({ type: 'broadcast', event: 'coin_collected', payload: { id } });
                 
